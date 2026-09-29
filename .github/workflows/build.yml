@@ -1495,3 +1495,5 @@ jobs:
       # Basename pattern: the callee passes it to `find -name`, which matches
       # the final path component only (a pattern with `/` never matches).
       tarball_glob: '*-targz-rootfs.tar.gz'
+
+# higoros-qmodem: fork activation touch.
