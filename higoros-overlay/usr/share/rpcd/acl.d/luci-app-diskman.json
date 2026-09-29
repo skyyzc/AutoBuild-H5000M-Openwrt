@@ -1,0 +1,7 @@
+{
+	"luci-app-diskman": {
+		"description": "Disk manager entry (real UI lives in the HigoOS dashboard on port 80)",
+		"read": {},
+		"write": {}
+	}
+}

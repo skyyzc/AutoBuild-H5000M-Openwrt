@@ -72,6 +72,28 @@ ENABLE_WWAND="${ENABLE_WWAND:-true}"
 # module temperature in the fan curve should pick this and give up wwand.
 ENABLE_MT5700M="${ENABLE_MT5700M:-false}"
 
+# QModem — FUjr/QModem 5G modem stack.  The H5000M units actually seen in the
+# wild carry a Quectel RG520N-CN (USB 2c7c:0801, QMI), not the TD Tech
+# MT5700M the wwand stack was written for; QModem dials it over the mainline
+# qmi_wwan driver and its LuCI panels manage signal/SMS/bands.  Mutually
+# exclusive with wwand / luci-app-mt5700m (see resolve_modem_stack).
+ENABLE_QMODEM="${ENABLE_QMODEM:-false}"
+QMODEM_REPO_URL="${QMODEM_REPO_URL:-https://github.com/FUjr/QModem.git}"
+QMODEM_REPO_BRANCH="${QMODEM_REPO_BRANCH:-main}"
+
+# OpenAppFilter — destan19/OpenAppFilter (appfilter userspace + kmod-oaf +
+# luci-app-oaf).  Not in any official feed; pulled in as its own feed.
+ENABLE_OAF="${ENABLE_OAF:-false}"
+OAF_REPO_URL="${OAF_REPO_URL:-https://github.com/destan19/OpenAppFilter.git}"
+OAF_REPO_BRANCH="${OAF_REPO_BRANCH:-master}"
+
+# HigoOS preservation — stage higoros-overlay/ (the vendor higorosd backend,
+# its Vue web UI, the userspace fan controller and the MT7992 EEPROM data)
+# into the build tree's files/ directory so the vendor panel keeps working on
+# mainline.  The overlay files ship verbatim; the config block below only
+# carries what the panel needs from the package world.
+ENABLE_HIGOROS="${ENABLE_HIGOROS:-false}"
+
 # ------------------------------------------------------- optional services ---
 ENABLE_UPNP="${ENABLE_UPNP:-true}"
 # Not built in by default.  Adblock and HomeProxy are both useful and both
@@ -485,7 +507,7 @@ check_environment() {
 show_features() {
 	log "Upstream      : ${REPO_URL} (${REPO_BRANCH}, track=${OPENWRT_TRACK})"
 	log "Target        : ${TARGET_BOARD}/${TARGET_SUBTARGET} profile=${TARGET_PROFILE}"
-	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M}"
+	log "Board stack   : fancontrol=${ENABLE_FANCONTROL} netmode=${ENABLE_NETMODE} wwand=${ENABLE_WWAND} mt5700m=${ENABLE_MT5700M} qmodem=${ENABLE_QMODEM} oaf=${ENABLE_OAF} higoros=${ENABLE_HIGOROS}"
 	log "UI            : argon=${ENABLE_THEME_ARGON}"
 	# Say plainly whether the default network is open — "encryption=none" is
 	# easy to miss in a build log and this is a security-relevant default.
@@ -513,8 +535,30 @@ resolve_modem_stack() {
 		ENABLE_MT5700M=false
 	fi
 
-	if ! is_true "$ENABLE_WWAND" && ! is_true "$ENABLE_MT5700M"; then
-		warn "Neither ENABLE_WWAND nor ENABLE_MT5700M is set: the image will have no cellular dialer,"
+	if is_true "$ENABLE_QMODEM"; then
+		if is_true "$ENABLE_WWAND" || is_true "$ENABLE_MT5700M"; then
+			warn "ENABLE_QMODEM is mutually exclusive with wwand / luci-app-mt5700m"
+			warn "(all three want to own the cellular data path)."
+			warn "Keeping QModem and DISABLING the other dialer(s)."
+		fi
+		ENABLE_WWAND=false
+		ENABLE_MT5700M=false
+	fi
+
+	# The vendor HigoOS panel has its own fan page (driving /usr/bin/fancontrol
+	# from the overlay) and its own network management.  FAN789's fan app and
+	# netmode would each put a second manager on the same job.
+	if is_true "$ENABLE_HIGOROS"; then
+		if is_true "$ENABLE_FANCONTROL" || is_true "$ENABLE_NETMODE"; then
+			warn "ENABLE_HIGOROS ships the vendor panel with its own fan/network pages."
+			warn "DISABLING luci-app-h5000m-fancontrol and luci-app-h5000m-netmode to avoid two managers."
+		fi
+		ENABLE_FANCONTROL=false
+		ENABLE_NETMODE=false
+	fi
+
+	if ! is_true "$ENABLE_WWAND" && ! is_true "$ENABLE_MT5700M" && ! is_true "$ENABLE_QMODEM"; then
+		warn "Neither ENABLE_WWAND nor ENABLE_MT5700M nor ENABLE_QMODEM is set: the image will have no cellular dialer,"
 		warn "and luci-app-h5000m-netmode will have no modem interface to arbitrate."
 	fi
 }
@@ -579,15 +623,23 @@ prepare_source() {
 write_feeds_conf() {
 	# The base feeds are always present.  The qmodem feed is *conditional*:
 	# luci-app-mt5700m hard-depends on ubus-at-daemon and sms-tool_q, and those
-	# two packages exist only there.  QModem is a whole competing modem stack
-	# (its own drivers and its own LuCI panel), so it must not be dragged into a
-	# wwand build — and on the wwand path nothing needs it.
+	# two packages exist only there.  ENABLE_QMODEM needs the same feed for the
+	# modem stack itself (qmodem, quectel-CM-5G-M, luci-app-qmodem-next).  OAF
+	# is its own third-party feed, needed only when the app filter is wanted.
 	{
 		cat "${ROOT_DIR}/feeds.conf.default"
 		if is_true "$ENABLE_MT5700M"; then
 			printf '\n# Added because ENABLE_MT5700M=true. luci-app-mt5700m hard-depends on\n'
 			printf '# ubus-at-daemon and sms-tool_q, which are only packaged here.\n'
 			printf 'src-git qmodem %s;%s\n' "$QMODEM_REPO_URL" "$QMODEM_REPO_BRANCH"
+		elif is_true "$ENABLE_QMODEM"; then
+			printf '\n# Added because ENABLE_QMODEM=true. The QModem modem stack lives only\n'
+			printf '# in this feed; mainline OpenWrt does not package it.\n'
+			printf 'src-git qmodem %s;%s\n' "$QMODEM_REPO_URL" "$QMODEM_REPO_BRANCH"
+		fi
+		if is_true "$ENABLE_OAF"; then
+			printf '\n# Added because ENABLE_OAF=true. OpenAppFilter is not in any official feed.\n'
+			printf 'src-git oaf %s;%s\n' "$OAF_REPO_URL" "$OAF_REPO_BRANCH"
 		fi
 	} >"$SRC/feeds.conf.default"
 }
@@ -660,6 +712,61 @@ prepare_feeds() {
 		die "feeds install failed"
 
 	verify_wwand_feed
+	fix_qmodem_feed
+	verify_qmodem_feed
+	verify_oaf_feed
+}
+
+# Two known upstream defects, both observed in LianXia233's CI (which builds
+# this exact stack every day) and both fixed by patching the feed checkout:
+#
+#   1. version.mk ships QMODEM_VERSION like "3.4.0-rc.3"; apk rejects dashes in
+#      versions, so rewrite to the apk-legal "3.4.0_rc3".
+#   2. sms-forwarder-next gained "+qmodem-sipd" in DEPENDS, forming a chain
+#      that ends in the qmodem-voip libwebsockets variant and makes the apk
+#      staging fail with "unable to select packages".  The SIP channel is not
+#      wanted here, so drop the dependency.
+fix_qmodem_feed() {
+	local feed="${SRC}/feeds/qmodem" ver sf
+
+	[ -d "$feed" ] || return 0
+
+	ver="${feed}/version.mk"
+	if [ -f "$ver" ] && grep -qE '^QMODEM_VERSION:=[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' "$ver"; then
+		sed -i -E 's/^(QMODEM_VERSION:=)([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$/\1\2_rc\3/' "$ver"
+		log "qmodem: QMODEM_VERSION sanitized for apk ($(grep -E '^QMODEM_VERSION:=' "$ver"))"
+	fi
+
+	sf="${feed}/application/sms_forwarder_next/Makefile"
+	if [ -f "$sf" ] && grep -q '+qmodem-sipd' "$sf"; then
+		sed -i 's/ +qmodem-sipd//' "$sf"
+		log "qmodem: removed +qmodem-sipd from sms-forwarder-next DEPENDS (apk staging conflict)"
+	fi
+
+	return 0
+}
+
+verify_qmodem_feed() {
+	local feed="${SRC}/feeds/qmodem" d
+
+	if [ ! -d "$feed" ]; then
+		is_true "$ENABLE_QMODEM" &&
+			warn "qmodem feed is not present — ENABLE_QMODEM will fail its package check"
+		return 0
+	fi
+
+	for d in application/qmodem application/quectel_CM_5G_M luci/luci-app-qmodem-next; do
+		[ -d "${feed}/${d}" ] || warn "qmodem feed is missing ${d}"
+	done
+
+	return 0
+}
+
+verify_oaf_feed() {
+	if is_true "$ENABLE_OAF" && [ ! -d "${SRC}/feeds/oaf" ]; then
+		warn "oaf feed is not present — ENABLE_OAF will fail its package check"
+	fi
+	return 0
 }
 
 # The ddimension feed is not one directory per package: `wwand/Makefile` alone
@@ -1391,6 +1498,30 @@ EOF
 		# than ship entries pointing at a host that does not exist.
 		rm -f "${repo_dir}/50-h5000m.list"
 		log "Firmware apk source: none configured (set H5000M_APK_REPO_URL to add one)"
+	fi
+
+	return 0
+}
+
+# HigoOS preservation overlay — copy higoros-overlay/ into the build tree's
+# files/ directory.  OpenWrt copies files/ verbatim into the generated rootfs,
+# which is exactly how the vendor binaries (higorosd, the Vue UI, the
+# userspace fan controller and the MT7992 EEPROM data) ride a mainline image
+# without becoming packages.  A marker file records that files/ is ours so a
+# later build with the switch off can safely clean it up.
+stage_higoros_overlay() {
+	local marker="${SRC}/files/.higoros-overlay"
+
+	if is_true "$ENABLE_HIGOROS"; then
+		if [ ! -d "${ROOT_DIR}/higoros-overlay" ]; then
+			die "ENABLE_HIGOROS=true but higoros-overlay/ is missing from the repo — refusing to build a firmware the panel feature promises but cannot deliver"
+		fi
+		log "Staging HigoOS overlay into files/"
+		stage_directory "${ROOT_DIR}/higoros-overlay" "${SRC}/files"
+		touch "$marker"
+	elif [ -f "$marker" ]; then
+		log "Removing stale HigoOS overlay from files/"
+		rm -rf "${SRC}/files"
 	fi
 
 	return 0
@@ -2182,6 +2313,46 @@ CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
 EOF
 	fi
 
+	if is_true "$ENABLE_QMODEM"; then
+		cat >>"$out" <<'EOF'
+
+# QModem (FUjr feed) — the RG520N-CN dials over QMI on the mainline driver
+# set.  The vendor and NSS QMI drivers are deliberately not selected: they
+# register the same kernel module names as qmi_wwan and clash.
+CONFIG_PACKAGE_qmodem=y
+CONFIG_PACKAGE_quectel-CM-5G-M=y
+CONFIG_PACKAGE_luci-app-qmodem-next=y
+CONFIG_PACKAGE_luci-app-qmodem-generic=y
+CONFIG_PACKAGE_sms-forwarder-next=y
+CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+CONFIG_PACKAGE_kmod-usb-serial-option=y
+EOF
+	fi
+
+	if is_true "$ENABLE_OAF"; then
+		cat >>"$out" <<'EOF'
+
+# OpenAppFilter (destan19 feed) — app filter userspace + kernel module +
+# LuCI app.  Built from source in this tree, so the kmod vermagic matches
+# this kernel exactly.
+CONFIG_PACKAGE_luci-app-oaf=y
+CONFIG_PACKAGE_open-app-filter=y
+CONFIG_PACKAGE_kmod-oaf=y
+EOF
+	fi
+
+	if is_true "$ENABLE_HIGOROS"; then
+		cat >>"$out" <<'EOF'
+
+# HigoOS preservation.  The vendor panel itself ships through files/
+# (higoros-overlay/), not as a package; the config only has to provide the
+# pwm-fan hwmon driver the overlay's /usr/bin/fancontrol drives.  The
+# kernel cooling maps are already removed by patches/0001*, so nothing in
+# the kernel races the userspace controller for the PWM channel.
+CONFIG_PACKAGE_kmod-hwmon-pwmfan=y
+EOF
+	fi
+
 	cat >>"$out" <<'EOF'
 CONFIG_PACKAGE_h5000m-integration=y
 CONFIG_PACKAGE_luci-app-h5000m-accel=y
@@ -2741,6 +2912,9 @@ build_required_packages() {
 	is_true "$ENABLE_ADGUARDHOME" && REQUIRED_PACKAGES+=(adguardhome luci-app-adguardhome)
 	is_true "$ENABLE_UPNP" && REQUIRED_PACKAGES+=(luci-app-upnp miniupnpd-nftables)
 	is_true "$ENABLE_ADBLOCK" && REQUIRED_PACKAGES+=(adblock luci-app-adblock)
+	is_true "$ENABLE_QMODEM" && REQUIRED_PACKAGES+=(qmodem quectel-CM-5G-M luci-app-qmodem-next luci-app-qmodem-generic sms-forwarder-next kmod-usb-net-qmi-wwan kmod-usb-serial-option)
+	is_true "$ENABLE_OAF" && REQUIRED_PACKAGES+=(luci-app-oaf open-app-filter kmod-oaf)
+	is_true "$ENABLE_HIGOROS" && REQUIRED_PACKAGES+=(kmod-hwmon-pwmfan)
 
 	# Required, not cosmetic.  Every line above is `is_true X && ...`, so when
 	# the LAST switch is off the final statement returns 1 and — because this
@@ -2760,6 +2934,8 @@ build_expected_packages() {
 	EXPECTED_PACKAGES=()
 	is_true "$ENABLE_FANCONTROL" && EXPECTED_PACKAGES+=(luci-i18n-h5000m-fancontrol-zh-cn)
 	is_true "$ENABLE_NETMODE" && EXPECTED_PACKAGES+=(luci-i18n-h5000m-netmode-zh-cn)
+	is_true "$ENABLE_QMODEM" && EXPECTED_PACKAGES+=(luci-i18n-qmodem-next-zh-cn luci-i18n-qmodem-generic-zh-cn)
+	is_true "$ENABLE_OAF" && EXPECTED_PACKAGES+=(luci-i18n-oaf-zh-cn)
 	is_true "$ENABLE_UPNP" && EXPECTED_PACKAGES+=(luci-i18n-upnp-zh-cn)
 	is_true "$ENABLE_ADBLOCK" && EXPECTED_PACKAGES+=(luci-i18n-adblock-zh-cn)
 	return 0
@@ -3475,6 +3651,9 @@ enable_fancontrol=${ENABLE_FANCONTROL}
 enable_netmode=${ENABLE_NETMODE}
 enable_wwand=${ENABLE_WWAND}
 enable_mt5700m=${ENABLE_MT5700M}
+enable_qmodem=${ENABLE_QMODEM}
+enable_oaf=${ENABLE_OAF}
+enable_higoros=${ENABLE_HIGOROS}
 enable_upnp=${ENABLE_UPNP}
 enable_adblock=${ENABLE_ADBLOCK}
 enable_dockerman=${ENABLE_DOCKERMAN}
@@ -3516,6 +3695,7 @@ main() {
 	install_local_packages
 	install_board_plugins
 	install_theme
+	stage_higoros_overlay
 	install_external_packages
 	# After install_external_packages, which is what clones OpenWrt-nikki-rs —
 	# the clash-rs/Makefile this pins lives inside that clone.  It has to be

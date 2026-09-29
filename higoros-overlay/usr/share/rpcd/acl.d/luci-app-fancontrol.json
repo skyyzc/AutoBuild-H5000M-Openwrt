@@ -1,0 +1,11 @@
+{
+	"luci-app-fancontrol": {
+		"description": "Fan control entry (real UI lives in the HigoOS dashboard on port 80)",
+		"read": {
+			"uci": [ "fancontrol" ]
+		},
+		"write": {
+			"uci": [ "fancontrol" ]
+		}
+	}
+}

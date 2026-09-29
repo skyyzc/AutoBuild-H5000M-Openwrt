@@ -4,3 +4,16 @@
 *.patch text eol=lf
 *.config text eol=lf
 *.env text eol=lf
+
+# higoros-overlay: vendor files must land in the image byte-for-byte as they
+# were pulled off the device.  No line-ending games on firmware blobs, board
+# data or the static Go binary; scripts stay LF.
+higoros-overlay/**/*.bin binary
+higoros-overlay/**/*.dat binary
+higoros-overlay/**/*.js binary
+higoros-overlay/**/*.css binary
+higoros-overlay/**/*.html binary
+higoros-overlay/**/*.json binary
+higoros-overlay/**/*.svg binary
+higoros-overlay/usr/bin/higorosd binary
+higoros-overlay/usr/bin/fancontrol binary

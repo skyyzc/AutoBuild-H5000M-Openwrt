@@ -1,0 +1,10 @@
+{
+	"admin/system/diskman": {
+		"title": "Disk Manager",
+		"order": 65,
+		"action": { "type": "view", "path": "diskman" },
+		"depends": {
+			"acl": [ "luci-app-diskman" ]
+		}
+	}
+}

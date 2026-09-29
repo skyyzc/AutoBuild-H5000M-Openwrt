@@ -1,0 +1,314 @@
+#!/bin/sh
+# ============================================================================
+# fancontrol v2  —— HigoOS 风扇控制页面的后端调速程序（drop-in 替换）
+#
+# 契约（与 /etc/init.d/fancontrol、HigoOS 前端 FanControlSettings、higorosd
+#       /api/v1/system/fancontrol 完全一致，页面无需改动）：
+#   * 读取 uci  fancontrol.settings.*   : enable / thermal_file / fan_file /
+#       fan_rpm_file / start_temp / start_speed / max_speed / temp_div /
+#       mode / curve / curve_silent / curve_balanced / curve_performance
+#   * 命令行                            : -M <mode>   0=静音 1=均衡 2=性能
+#   * 热重载                            : 出现 /tmp/fancontrol.changed 时重读配置
+#   * 退出                              : 出现 /tmp/fancontrol.close  时退出
+#   * 输出                              : 向 fan_file 写 0..max_speed 的 PWM
+#
+# 与原版（24.10 厂商版 65KB ELF）的区别：
+#   1) 温度/PWM 路径自动探测（按 hwmon name 找，不认死编号）—— 换 25.12 基线必需
+#   2) 不再用 `iwpriv rax0 stat` 取 WiFi 温度（该通路在 24.10 就已是坏的，
+#      取值恒为哨兵 -100000），改为可选的 wifi_temp_file / wifi_temp_cmd
+#   3) 绝不擅自改写 uci（原版会偷改 thermal_file=/tmp/wifi_temperature 并 commit）
+#   4) 曲线缺失时逐级回退：curve -> 模式预设 -> 旧 start_temp/start_speed
+#   5) 传感器故障有 fail_speed 兜底，不会把风扇停死
+#
+# 用法：
+#   fancontrol                     正常守护（init 脚本的调用方式）
+#   fancontrol -M 2                指定模式守护
+#   fancontrol --selftest          打印一次判定结果（不写硬件）
+#   fancontrol --once              只调一次速然后退出
+#   fancontrol --once --dry-run    只算不写（验证用）
+# ============================================================================
+
+VERSION="2.0.0"
+NAME=fancontrol
+
+INTERVAL=5
+DRYRUN=0
+ONCE=0
+SELFTEST=0
+MODE_ARG=""
+
+SELFTEST=0
+logmsg() {
+	command -v logger >/dev/null 2>&1 && logger -t "$NAME" "$*"
+	[ "$SELFTEST" = "1" ] && echo "$*"
+	return 0
+}
+
+usage() {
+	cat <<EOF
+Usage: $0 [-M mode] [-i seconds] [--once] [--dry-run] [--selftest]
+  -M mode    0=静音 1=均衡 2=性能（覆盖 uci mode）
+  -i sec     采样间隔，默认 5
+  --once     只执行一次
+  --dry-run  只计算，不写 PWM
+  --selftest 打印一次完整判定
+EOF
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-M) MODE_ARG="$2"; shift 2 ;;
+		-i) INTERVAL="$2"; shift 2 ;;
+		--once) ONCE=1; shift ;;
+		--dry-run) DRYRUN=1; shift ;;
+		--selftest) SELFTEST=1; ONCE=1; DRYRUN=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) shift ;;
+	esac
+done
+
+cfg_get() { uci -q get "fancontrol.settings.$1" 2>/dev/null; }
+
+is_int() {
+	case "$1" in
+		''|*[!0-9-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+# ---------------------------------------------------------------- 自动探测 ---
+detect_pwm_file() {
+	_cfg=$(cfg_get fan_file)
+	if [ -n "$_cfg" ] && [ -w "$_cfg" ]; then echo "$_cfg"; return 0; fi
+	for _h in /sys/class/hwmon/hwmon*; do
+		[ -e "$_h/name" ] || continue
+		case "$(cat "$_h/name" 2>/dev/null)" in
+			pwmfan|pwm-fan|pwm_fan)
+				[ -w "$_h/pwm1" ] && { echo "$_h/pwm1"; return 0; } ;;
+		esac
+	done
+	for _p in /sys/devices/platform/pwm-fan/hwmon/hwmon*/pwm1; do
+		[ -w "$_p" ] && { echo "$_p"; return 0; }
+	done
+	[ -n "$_cfg" ] && { echo "$_cfg"; return 0; }
+	return 1
+}
+
+detect_temp_file() {
+	_cfg=$(cfg_get thermal_file)
+	[ -n "$_cfg" ] && [ -r "$_cfg" ] && { echo "$_cfg"; return 0; }
+	for _z in /sys/class/thermal/thermal_zone*; do
+		[ -e "$_z/type" ] || continue
+		case "$(cat "$_z/type" 2>/dev/null)" in
+			cpu-thermal|cpu_thermal|soc-thermal|soc_thermal|mtk-thermal|mtk_thermal)
+				[ -r "$_z/temp" ] && { echo "$_z/temp"; return 0; } ;;
+		esac
+	done
+	[ -r /sys/class/thermal/thermal_zone0/temp ] && { echo /sys/class/thermal/thermal_zone0/temp; return 0; }
+	[ -n "$_cfg" ] && { echo "$_cfg"; return 0; }
+	return 1
+}
+
+# 读温度 -> 摄氏度整数；失败返回 1
+read_temp_c() {
+	[ -r "$1" ] || return 1
+	_raw=$(cat "$1" 2>/dev/null)
+	is_int "$_raw" || return 1
+	[ "$TEMP_DIV" -gt 0 ] 2>/dev/null || TEMP_DIV=1000
+	_t=$((_raw / TEMP_DIV))
+	[ "$_t" -lt -40 ] && return 1
+	[ "$_t" -gt 150 ] && return 1
+	echo "$_t"
+	return 0
+}
+
+read_alt_temp_c() {
+	if [ -n "$WIFI_TEMP_CMD" ]; then
+		_v=$($WIFI_TEMP_CMD 2>/dev/null | tr -dc '0-9-')
+		if is_int "$_v" && [ "$_v" -gt -40 ] && [ "$_v" -lt 150 ]; then
+			echo "$_v"; return 0
+		fi
+	fi
+	if [ -n "$WIFI_TEMP_FILE" ] && [ -r "$WIFI_TEMP_FILE" ]; then
+		read_temp_c "$WIFI_TEMP_FILE" && return 0
+	fi
+	return 1
+}
+
+# ------------------------------------------------ 曲线：逐点线性插值 -> % ---
+curve_speed() {
+	_curve="$1"; _t="$2"
+	[ -n "$_curve" ] || return 1
+	_pts=$(echo "$_curve" | tr ',' '\n' | grep ':' | sort -t: -k1 -n)
+	[ -n "$_pts" ] || return 1
+
+	_prev_t=""; _prev_s=""; _last_s=""; _out=""
+	for _p in $_pts; do
+		_x=${_p%%:*}; _y=${_p##*:}
+		is_int "$_x" || continue
+		is_int "$_y" || continue
+		if [ "$_t" -le "$_x" ]; then
+			if [ -z "$_prev_t" ]; then
+				_out=$_y
+			else
+				_dt=$((_x - _prev_t))
+				if [ "$_dt" -le 0 ]; then
+					_out=$_y
+				else
+					_out=$((_prev_s + (_y - _prev_s) * (_t - _prev_t) / _dt))
+				fi
+			fi
+			break
+		fi
+		_prev_t=$_x; _prev_s=$_y; _last_s=$_y
+	done
+	[ -z "$_out" ] && _out=$_last_s
+	is_int "$_out" || return 1
+	[ "$_out" -lt 0 ] && _out=0
+	[ "$_out" -gt 100 ] && _out=100
+	echo "$_out"
+	return 0
+}
+
+# ------------------------------------------------------------- 配置载入 ---
+load_cfg() {
+	ENABLE=$(cfg_get enable);		is_int "$ENABLE" || ENABLE=1
+	MODE_UCI=$(cfg_get mode);		is_int "$MODE_UCI" || MODE_UCI=1
+	MAX_SPEED=$(cfg_get max_speed);		is_int "$MAX_SPEED" || MAX_SPEED=255
+	TEMP_DIV=$(cfg_get temp_div);		is_int "$TEMP_DIV" || TEMP_DIV=1000
+	START_TEMP=$(cfg_get start_temp);	is_int "$START_TEMP" || START_TEMP=45
+	START_SPEED=$(cfg_get start_speed);	is_int "$START_SPEED" || START_SPEED=35
+	FAIL_SPEED=$(cfg_get fail_speed);	is_int "$FAIL_SPEED" || FAIL_SPEED=60
+	HYST=$(cfg_get hyst);			is_int "$HYST" || HYST=3
+	CURVE=$(cfg_get curve)
+	CURVE_SILENT=$(cfg_get curve_silent)
+	CURVE_BALANCED=$(cfg_get curve_balanced)
+	CURVE_PERF=$(cfg_get curve_performance)
+	WIFI_TEMP_CMD=$(cfg_get wifi_temp_cmd)
+	WIFI_TEMP_FILE=$(cfg_get wifi_temp_file)
+	FORCE_ENABLE=$(cfg_get pwm_enable_value)
+
+	if [ -n "$MODE_ARG" ]; then MODE="$MODE_ARG"; else MODE="$MODE_UCI"; fi
+
+	PWM_FILE=$(detect_pwm_file)
+	TEMP_FILE=$(detect_temp_file)
+
+	# 生效曲线：页面上的“当前曲线”优先，其次按模式取预设
+	if [ -n "$CURVE" ]; then
+		ACTIVE_CURVE="$CURVE"; CURVE_SRC="curve"
+	else
+		case "$MODE" in
+			0) ACTIVE_CURVE="$CURVE_SILENT"; CURVE_SRC="curve_silent" ;;
+			2) ACTIVE_CURVE="$CURVE_PERF";   CURVE_SRC="curve_performance" ;;
+			*) ACTIVE_CURVE="$CURVE_BALANCED"; CURVE_SRC="curve_balanced" ;;
+		esac
+	fi
+
+	# pwm1_enable=1（manual）是“用户态独占风扇”的开关：实测内核 cooling map
+	# 会自己更新 cur_state，但只有 manual 模式下 pwm1 由我们说了算。
+	# 默认确保为 1；ucu 里把 pwm_enable_value 设成 '-' 可完全不动它。
+	if [ "$FORCE_ENABLE" != "-" ] && [ -n "$PWM_FILE" ]; then
+		is_int "$FORCE_ENABLE" || FORCE_ENABLE=1
+		_EN="${PWM_FILE%/*}/pwm1_enable"
+		if [ -w "$_EN" ] && [ "$(cat "$_EN" 2>/dev/null)" != "$FORCE_ENABLE" ]; then
+			echo "$FORCE_ENABLE" > "$_EN" 2>/dev/null
+			logmsg "set $(basename "$_EN")=$FORCE_ENABLE (userland takes over pwm)"
+		fi
+	fi
+}
+
+# 计算一次：输出 "speed temp src"（speed 为百分比）
+decide() {
+	_t=$(read_temp_c "$TEMP_FILE" 2>/dev/null) || _t=""
+	_alt=$(read_alt_temp_c 2>/dev/null) || _alt=""
+	if [ -z "$_t" ] && [ -z "$_alt" ]; then
+		echo "$FAIL_SPEED ? fail"
+		return 0
+	fi
+	if [ -n "$_alt" ] && { [ -z "$_t" ] || [ "$_alt" -gt "$_t" ]; }; then
+		_use=$_alt; _src=WiFi
+	else
+		_use=$_t; _src=CPU
+	fi
+	_s=$(curve_speed "$ACTIVE_CURVE" "$_use" 2>/dev/null) || _s=""
+	if [ -z "$_s" ]; then
+		if [ "$_use" -lt "$START_TEMP" ]; then
+			_s=0
+		else
+			_s=$((START_SPEED + (100 - START_SPEED) * (_use - START_TEMP) / 55))
+			[ "$_s" -gt 100 ] && _s=100
+		fi
+	fi
+	echo "$_s $_use $_src"
+	return 0
+}
+
+# ------------------------------------------------------------------ 主流程 ---
+load_cfg
+
+if [ "$SELFTEST" != "1" ] && [ "$ENABLE" != "1" ]; then
+	logmsg "disabled by uci (enable=$ENABLE), exiting"
+	exit 0
+fi
+
+if [ -z "$PWM_FILE" ]; then
+	logmsg "FATAL: no writable pwm file found (uci fan_file='$(cfg_get fan_file)')"
+	[ "$SELFTEST" = "1" ] && echo "pwm file     = (none)"
+	exit 1
+fi
+
+if [ "$SELFTEST" = "1" ]; then
+	set -- $(decide)
+	_pwm=$(($1 * MAX_SPEED / 100))
+	echo "fancontrol v$VERSION selftest"
+	echo "  enable       = $ENABLE"
+	echo "  mode         = $MODE (uci=$MODE_UCI arg=${MODE_ARG:-none})"
+	echo "  curve source = $CURVE_SRC"
+	echo "  temp file    = $TEMP_FILE"
+	echo "  pwm file     = $PWM_FILE"
+	echo "  temp / src   = $2 C / $3"
+	echo "  speed / pwm  = $1 % / $_pwm (max_speed=$MAX_SPEED)"
+	echo "  pwm1 now     = $(cat "$PWM_FILE" 2>/dev/null)"
+	[ -e "${PWM_FILE%/*}/pwm1_enable" ] && echo "  pwm1_enable  = $(cat "${PWM_FILE%/*}/pwm1_enable" 2>/dev/null)"
+	exit 0
+fi
+
+logmsg "started v$VERSION temp=$TEMP_FILE pwm=$PWM_FILE mode=$MODE curve=$CURVE_SRC interval=${INTERVAL}s"
+
+_prev_sp=-1; _prev_pwm=-1
+while :; do
+	if [ -e /tmp/fancontrol.close ]; then
+		rm -f /tmp/fancontrol.close
+		logmsg "close flag, exiting"
+		exit 0
+	fi
+	if [ -e /tmp/fancontrol.changed ]; then
+		rm -f /tmp/fancontrol.changed
+		load_cfg
+		logmsg "reloaded temp=$TEMP_FILE pwm=$PWM_FILE mode=$MODE curve=$CURVE_SRC enable=$ENABLE"
+		[ "$ENABLE" != "1" ] && { logmsg "disabled by uci, exiting"; exit 0; }
+		[ -z "$PWM_FILE" ] && { logmsg "FATAL: pwm file lost"; exit 1; }
+		_prev_sp=-1; _prev_pwm=-1
+	fi
+
+	set -- $(decide)
+	_sp=$1; _temp=$2; _src=$3
+	_pwm=$((_sp * MAX_SPEED / 100))
+	[ "$_pwm" -gt "$MAX_SPEED" ] && _pwm=$MAX_SPEED
+
+	# 迟滞：升温立即跟随，降温幅度小于 hyst 时保持
+	if [ "$_prev_sp" -ge 0 ] && [ "$_pwm" -lt "$_prev_pwm" ] && [ "$HYST" -gt 0 ]; then
+		if [ $((_prev_sp - _sp)) -lt "$HYST" ]; then
+			_pwm=$_prev_pwm; _sp=$_prev_sp
+		fi
+	fi
+
+	if [ "$_sp" -ne "$_prev_sp" ]; then
+		logmsg "temp=${_temp}C(${_src}) speed=${_sp}% pwm=${_pwm} mode=${MODE}"
+	fi
+	[ "$DRYRUN" != "1" ] && echo "$_pwm" > "$PWM_FILE" 2>/dev/null
+	_prev_sp=$_sp; _prev_pwm=$_pwm
+
+	[ "$ONCE" = "1" ] && exit 0
+	sleep "$INTERVAL"
+done

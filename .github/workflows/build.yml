@@ -24,6 +24,18 @@ on:
         description: '5G 拨号器 ddimension wwand'
         type: boolean
         default: true
+      enable_qmodem:
+        description: '5G 拨号器 QModem(FUjr) 栈 —— 启用后 wwand 自动关闭（RG520N-CN 走 QMI）'
+        type: boolean
+        default: true
+      enable_oaf:
+        description: 'OpenAppFilter 应用过滤（destan19，kmod 同树编译）'
+        type: boolean
+        default: true
+      enable_higoros:
+        description: 'HigoOS 海狗面板保留（higoros-overlay：厂商后端+前端+风扇控制器）—— 启用后 FAN789 风扇/网络插件自动关闭'
+        type: boolean
+        default: true
       enable_mt5700m:
         description: '5G 拨号器 luci-app-mt5700m 启用后 wwand 会被自动关闭'
         type: boolean
@@ -403,6 +415,9 @@ jobs:
           ENABLE_FANCONTROL: 'true'
           ENABLE_NETMODE: 'true'
           ENABLE_WWAND: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_wwand) || 'true' }}
+          ENABLE_QMODEM: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_qmodem) || 'true' }}
+          ENABLE_OAF: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_oaf) || 'true' }}
+          ENABLE_HIGOROS: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_higoros) || 'true' }}
           ENABLE_MT5700M: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enable_mt5700m) || 'false' }}
           ENABLE_UPNP: 'true'
           ENABLE_THEME_ARGON: 'true'
